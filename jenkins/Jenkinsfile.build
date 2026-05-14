@@ -1,0 +1,213 @@
+// ============================================================
+//  CI Pipeline – Attendance Management System
+//  Triggers on every push to main/master via GitHub Webhook
+// ============================================================
+pipeline {
+    agent any
+
+    // ── Tool versions declared in Jenkins → Global Tool Configuration ──
+    tools {
+        maven 'Maven-3.9'
+        jdk   'JDK-17'
+    }
+
+    // ── Environment variables ──────────────────────────────────────────
+    environment {
+        APP_NAME        = 'attendance-management-system'
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPOSITORY  = 'attendance-management-system'
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        FULL_IMAGE_NAME = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+        // Credentials IDs configured in Jenkins Credentials Store
+        AWS_CREDENTIALS = 'aws-credentials'
+        EMAIL_RECIPIENT = "${BUILD_USER_EMAIL}"   // injected by Build User Vars plugin
+    }
+
+    // ── Triggers: GitHub webhook sends push events ─────────────────────
+    triggers {
+        githubPush()
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ── Stage 1: Checkout ──────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo "==> Checking out source code from GitHub..."
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_COMMIT_AUTHOR = sh(
+                        script: "git log -1 --pretty=format:'%an <%ae>'",
+                        returnStdout: true
+                    ).trim()
+                    echo "Commit: ${env.GIT_COMMIT_SHORT} by ${env.GIT_COMMIT_AUTHOR}"
+                }
+            }
+        }
+
+        // ── Stage 2: Unit Tests ────────────────────────────────────────
+        stage('Test') {
+            steps {
+                echo "==> Running unit tests with Maven..."
+                sh 'mvn clean test -B'
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                    jacoco(
+                        execPattern: '**/target/jacoco.exec',
+                        classPattern: '**/target/classes',
+                        sourcePattern: '**/src/main/java'
+                    )
+                }
+                failure {
+                    echo "Tests FAILED! Aborting pipeline."
+                }
+            }
+        }
+
+        // ── Stage 3: Build JAR ─────────────────────────────────────────
+        stage('Build') {
+            steps {
+                echo "==> Building Spring Boot JAR..."
+                sh 'mvn clean package -DskipTests -B'
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+
+        // ── Stage 4: Docker Build ──────────────────────────────────────
+        stage('Docker Build') {
+            steps {
+                echo "==> Building Docker image: ${FULL_IMAGE_NAME}"
+                sh """
+                    docker build \
+                        --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                        --build-arg GIT_COMMIT=${GIT_COMMIT_SHORT} \
+                        -t ${ECR_REPOSITORY}:${IMAGE_TAG} \
+                        -t ${ECR_REPOSITORY}:latest \
+                        .
+                """
+            }
+        }
+
+        // ── Stage 5: Push to AWS ECR ───────────────────────────────────
+        stage('Push to ECR') {
+            steps {
+                echo "==> Authenticating with AWS ECR..."
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDENTIALS}",
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh """
+                        # Authenticate Docker with ECR
+                        aws ecr get-login-password \
+                            --region ${AWS_REGION} | \
+                        docker login \
+                            --username AWS \
+                            --password-stdin ${ECR_REGISTRY}
+
+                        # Create ECR repo if it doesn't exist
+                        aws ecr describe-repositories \
+                            --repository-names ${ECR_REPOSITORY} \
+                            --region ${AWS_REGION} 2>/dev/null || \
+                        aws ecr create-repository \
+                            --repository-name ${ECR_REPOSITORY} \
+                            --region ${AWS_REGION} \
+                            --image-scanning-configuration scanOnPush=true
+
+                        # Tag with both build number and latest
+                        docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${FULL_IMAGE_NAME}
+                        docker tag ${ECR_REPOSITORY}:latest \
+                            ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+                        # Push both tags
+                        docker push ${FULL_IMAGE_NAME}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+                        echo "==> Successfully pushed image: ${FULL_IMAGE_NAME}"
+                    """
+                }
+            }
+        }
+
+        // ── Stage 6: Cleanup local images ─────────────────────────────
+        stage('Cleanup') {
+            steps {
+                echo "==> Cleaning up local Docker images..."
+                sh """
+                    docker rmi ${ECR_REPOSITORY}:${IMAGE_TAG} || true
+                    docker rmi ${ECR_REPOSITORY}:latest || true
+                    docker rmi ${FULL_IMAGE_NAME} || true
+                    docker image prune -f || true
+                """
+            }
+        }
+    }
+
+    // ── Post-build Notifications ───────────────────────────────────────
+    post {
+        success {
+            echo "==> BUILD SUCCEEDED! Build #${BUILD_NUMBER}"
+            emailext(
+                subject: "✅ [SUCCESS] Attendance System - Build #${BUILD_NUMBER}",
+                body: """
+                    <html><body style="font-family:Arial,sans-serif;">
+                    <h2 style="color:#28a745;">✅ Build Successful</h2>
+                    <table border="1" cellpadding="8" style="border-collapse:collapse;">
+                        <tr><td><b>Project</b></td><td>${APP_NAME}</td></tr>
+                        <tr><td><b>Build #</b></td><td>${BUILD_NUMBER}</td></tr>
+                        <tr><td><b>Branch</b></td><td>${GIT_BRANCH}</td></tr>
+                        <tr><td><b>Commit</b></td><td>${GIT_COMMIT_SHORT}</td></tr>
+                        <tr><td><b>Author</b></td><td>${GIT_COMMIT_AUTHOR}</td></tr>
+                        <tr><td><b>Docker Image</b></td><td>${FULL_IMAGE_NAME}</td></tr>
+                        <tr><td><b>Duration</b></td><td>${currentBuild.durationString}</td></tr>
+                    </table>
+                    <p>Image has been pushed to ECR. 
+                       Use Build #<b>${BUILD_NUMBER}</b> in the Deploy Pipeline.</p>
+                    <p><a href="${BUILD_URL}">View Build Logs</a></p>
+                    </body></html>
+                """,
+                to: "${EMAIL_RECIPIENT}",
+                mimeType: 'text/html'
+            )
+        }
+        failure {
+            echo "==> BUILD FAILED! Build #${BUILD_NUMBER}"
+            emailext(
+                subject: "❌ [FAILED] Attendance System - Build #${BUILD_NUMBER}",
+                body: """
+                    <html><body style="font-family:Arial,sans-serif;">
+                    <h2 style="color:#dc3545;">❌ Build Failed</h2>
+                    <table border="1" cellpadding="8" style="border-collapse:collapse;">
+                        <tr><td><b>Project</b></td><td>${APP_NAME}</td></tr>
+                        <tr><td><b>Build #</b></td><td>${BUILD_NUMBER}</td></tr>
+                        <tr><td><b>Branch</b></td><td>${GIT_BRANCH}</td></tr>
+                        <tr><td><b>Commit</b></td><td>${GIT_COMMIT_SHORT}</td></tr>
+                        <tr><td><b>Failed Stage</b></td><td>${STAGE_NAME}</td></tr>
+                        <tr><td><b>Duration</b></td><td>${currentBuild.durationString}</td></tr>
+                    </table>
+                    <p><a href="${BUILD_URL}console">View Console Output</a></p>
+                    </body></html>
+                """,
+                to: "${EMAIL_RECIPIENT}",
+                mimeType: 'text/html'
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

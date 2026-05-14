@@ -1,0 +1,284 @@
+// ============================================================
+//  CD Pipeline – Attendance Management System
+//  Parameterized: choose environment + build number to deploy
+// ============================================================
+pipeline {
+    agent any
+
+    // ── Input parameters ──────────────────────────────────────────────
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['Staging', 'Production'],
+            description: 'Target deployment environment'
+        )
+        string(
+            name: 'BUILD_NUMBER_TO_DEPLOY',
+            defaultValue: '',
+            description: 'Jenkins CI Build Number (image tag) to deploy, e.g. 42'
+        )
+        booleanParam(
+            name: 'ROLLING_UPDATE',
+            defaultValue: true,
+            description: 'Deploy to EC2 instances one at a time (zero-downtime)'
+        )
+    }
+
+    // ── Environment variables ──────────────────────────────────────────
+    environment {
+        APP_NAME        = 'attendance-management-system'
+        APP_PORT        = '8086'
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPOSITORY  = 'attendance-management-system'
+        AWS_CREDENTIALS = 'aws-credentials'
+        SSH_CREDENTIALS = 'ec2-ssh-key'
+
+        // EC2 hosts – set these as Jenkins env vars or update below
+        // For HA: two EC2 instances behind ALB
+        EC2_HOST_1      = "${EC2_INSTANCE_1_IP}"
+        EC2_HOST_2      = "${EC2_INSTANCE_2_IP}"
+        EC2_USER        = 'ec2-user'
+
+        DEPLOY_IMAGE    = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${params.BUILD_NUMBER_TO_DEPLOY}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+    }
+
+    stages {
+
+        // ── Stage 1: Validate Parameters ──────────────────────────────
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.BUILD_NUMBER_TO_DEPLOY?.trim()) {
+                        error("BUILD_NUMBER_TO_DEPLOY is required!")
+                    }
+                    echo """
+                    ╔══════════════════════════════════════════╗
+                    ║         DEPLOYMENT PARAMETERS            ║
+                    ╠══════════════════════════════════════════╣
+                    ║ Environment : ${params.ENVIRONMENT.padRight(26)}║
+                    ║ Image Tag   : ${params.BUILD_NUMBER_TO_DEPLOY.padRight(26)}║
+                    ║ Rolling     : ${params.ROLLING_UPDATE.toString().padRight(26)}║
+                    ╚══════════════════════════════════════════╝
+                    """
+                }
+            }
+        }
+
+        // ── Stage 2: Verify Image in ECR ──────────────────────────────
+        stage('Verify ECR Image') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDENTIALS}",
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh """
+                        echo "==> Verifying image exists in ECR..."
+                        aws ecr describe-images \
+                            --repository-name ${ECR_REPOSITORY} \
+                            --image-ids imageTag=${params.BUILD_NUMBER_TO_DEPLOY} \
+                            --region ${AWS_REGION}
+                        echo "Image verified: ${DEPLOY_IMAGE}"
+                    """
+                }
+            }
+        }
+
+        // ── Stage 3: Deploy to EC2 Instance 1 ─────────────────────────
+        stage('Deploy to Instance 1') {
+            steps {
+                echo "==> Deploying to EC2 Instance 1 (${EC2_HOST_1})..."
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: "${SSH_CREDENTIALS}",
+                        keyFileVariable: 'SSH_KEY'
+                    ),
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "${AWS_CREDENTIALS}",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]
+                ]) {
+                    sh """
+                        # Copy deploy script to instance 1
+                        scp -i ${SSH_KEY} \
+                            -o StrictHostKeyChecking=no \
+                            scripts/deploy.sh \
+                            ${EC2_USER}@${EC2_HOST_1}:/tmp/deploy.sh
+
+                        # Execute deployment on instance 1
+                        ssh -i ${SSH_KEY} \
+                            -o StrictHostKeyChecking=no \
+                            ${EC2_USER}@${EC2_HOST_1} \
+                            "chmod +x /tmp/deploy.sh && \
+                             AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
+                             AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
+                             AWS_REGION=${AWS_REGION} \
+                             ECR_REGISTRY=${ECR_REGISTRY} \
+                             ECR_REPOSITORY=${ECR_REPOSITORY} \
+                             IMAGE_TAG=${params.BUILD_NUMBER_TO_DEPLOY} \
+                             APP_PORT=${APP_PORT} \
+                             APP_ENV=${params.ENVIRONMENT} \
+                             INSTANCE_ID=instance-1 \
+                             /tmp/deploy.sh"
+                    """
+                }
+            }
+        }
+
+        // ── Stage 4: Health Check Instance 1 ──────────────────────────
+        stage('Health Check Instance 1') {
+            steps {
+                script {
+                    echo "==> Waiting for instance 1 to become healthy..."
+                    sh """
+                        for i in \$(seq 1 12); do
+                            HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' \
+                                http://${EC2_HOST_1}:${APP_PORT}/attendance/status \
+                                --max-time 5 || echo "000")
+                            if [ "\$HTTP_CODE" = "200" ]; then
+                                echo "Instance 1 is HEALTHY (attempt \$i)"
+                                exit 0
+                            fi
+                            echo "Attempt \$i: status=\$HTTP_CODE, retrying in 10s..."
+                            sleep 10
+                        done
+                        echo "Instance 1 health check FAILED"
+                        exit 1
+                    """
+                }
+            }
+        }
+
+        // ── Stage 5: Deploy to EC2 Instance 2 ─────────────────────────
+        stage('Deploy to Instance 2') {
+            steps {
+                echo "==> Deploying to EC2 Instance 2 (${EC2_HOST_2})..."
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: "${SSH_CREDENTIALS}",
+                        keyFileVariable: 'SSH_KEY'
+                    ),
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: "${AWS_CREDENTIALS}",
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]
+                ]) {
+                    sh """
+                        scp -i ${SSH_KEY} \
+                            -o StrictHostKeyChecking=no \
+                            scripts/deploy.sh \
+                            ${EC2_USER}@${EC2_HOST_2}:/tmp/deploy.sh
+
+                        ssh -i ${SSH_KEY} \
+                            -o StrictHostKeyChecking=no \
+                            ${EC2_USER}@${EC2_HOST_2} \
+                            "chmod +x /tmp/deploy.sh && \
+                             AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
+                             AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
+                             AWS_REGION=${AWS_REGION} \
+                             ECR_REGISTRY=${ECR_REGISTRY} \
+                             ECR_REPOSITORY=${ECR_REPOSITORY} \
+                             IMAGE_TAG=${params.BUILD_NUMBER_TO_DEPLOY} \
+                             APP_PORT=${APP_PORT} \
+                             APP_ENV=${params.ENVIRONMENT} \
+                             INSTANCE_ID=instance-2 \
+                             /tmp/deploy.sh"
+                    """
+                }
+            }
+        }
+
+        // ── Stage 6: Health Check Instance 2 ──────────────────────────
+        stage('Health Check Instance 2') {
+            steps {
+                sh """
+                    for i in \$(seq 1 12); do
+                        HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' \
+                            http://${EC2_HOST_2}:${APP_PORT}/attendance/status \
+                            --max-time 5 || echo "000")
+                        if [ "\$HTTP_CODE" = "200" ]; then
+                            echo "Instance 2 is HEALTHY (attempt \$i)"
+                            exit 0
+                        fi
+                        echo "Attempt \$i: status=\$HTTP_CODE, retrying in 10s..."
+                        sleep 10
+                    done
+                    echo "Instance 2 health check FAILED"
+                    exit 1
+                """
+            }
+        }
+
+        // ── Stage 7: Smoke Test via ALB ───────────────────────────────
+        stage('Smoke Test via ALB') {
+            when { expression { params.ENVIRONMENT == 'Production' } }
+            steps {
+                sh """
+                    echo "==> Smoke testing through ALB..."
+                    for i in \$(seq 1 3); do
+                        curl -sf http://${ALB_DNS_NAME}/attendance/status \
+                            | grep -q '"status":"UP"' && \
+                            echo "ALB smoke test passed (attempt \$i)" || \
+                            (echo "ALB smoke test failed" && exit 1)
+                        sleep 2
+                    done
+                """
+            }
+        }
+    }
+
+    // ── Post-build Notifications ───────────────────────────────────────
+    post {
+        success {
+            emailext(
+                subject: "✅ [DEPLOYED] ${params.ENVIRONMENT} - Build #${params.BUILD_NUMBER_TO_DEPLOY}",
+                body: """
+                    <html><body style="font-family:Arial,sans-serif;">
+                    <h2 style="color:#28a745;">✅ Deployment Successful</h2>
+                    <table border="1" cellpadding="8" style="border-collapse:collapse;">
+                        <tr><td><b>Application</b></td><td>Attendance Management System</td></tr>
+                        <tr><td><b>Environment</b></td><td>${params.ENVIRONMENT}</td></tr>
+                        <tr><td><b>Image Tag</b></td><td>${params.BUILD_NUMBER_TO_DEPLOY}</td></tr>
+                        <tr><td><b>Instances</b></td><td>${EC2_HOST_1}, ${EC2_HOST_2}</td></tr>
+                        <tr><td><b>Duration</b></td><td>${currentBuild.durationString}</td></tr>
+                    </table>
+                    <p>Application is live at:
+                       <a href="http://${ALB_DNS_NAME}/attendance/status">
+                       http://${ALB_DNS_NAME}</a></p>
+                    </body></html>
+                """,
+                to: "${BUILD_USER_EMAIL}",
+                mimeType: 'text/html'
+            )
+        }
+        failure {
+            emailext(
+                subject: "❌ [DEPLOY FAILED] ${params.ENVIRONMENT} - Build #${params.BUILD_NUMBER_TO_DEPLOY}",
+                body: """
+                    <html><body style="font-family:Arial,sans-serif;">
+                    <h2 style="color:#dc3545;">❌ Deployment Failed</h2>
+                    <table border="1" cellpadding="8" style="border-collapse:collapse;">
+                        <tr><td><b>Environment</b></td><td>${params.ENVIRONMENT}</td></tr>
+                        <tr><td><b>Image Tag</b></td><td>${params.BUILD_NUMBER_TO_DEPLOY}</td></tr>
+                        <tr><td><b>Failed Stage</b></td><td>${STAGE_NAME}</td></tr>
+                    </table>
+                    <p><a href="${BUILD_URL}console">View Console Output</a></p>
+                    </body></html>
+                """,
+                to: "${BUILD_USER_EMAIL}",
+                mimeType: 'text/html'
+            )
+        }
+    }
+}

@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  attendance-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendance-app
+    ports:
+      - "8086:8086"
+    environment:
+      - APP_ENV=development
+      - INSTANCE_ID=local-docker
+      - SPRING_PROFILES_ACTIVE=default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8086/attendance/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - attendance-net
+
+networks:
+  attendance-net:
+    driver: bridge
